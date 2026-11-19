@@ -8,7 +8,7 @@ echo "* Building Bare-Metal Bleeding Edge GCC *"
 echo "*****************************************"
 
 # Declare the number of jobs to run simultaneously
-JOBS=$(nproc --all)
+JOBS=${JOBS:-$(nproc --all)}
 
 # TODO: Add more dynamic option handling
 while getopts a:p: flag; do
@@ -111,12 +111,12 @@ build_gcc() {
     --disable-nls \
     --disable-shared \
     --enable-default-ssp \
-    --enable-languages=c,c++,fortran \
-    --enable-threads=posix \
+    --enable-languages=c \
+    --disable-threads \
+    --without-headers \
     --prefix="$PREFIX" \
     --with-gnu-as \
     --with-gnu-ld \
-    --with-headers="/usr/include" \
     --with-linker-hash-style=gnu \
     --with-newlib \
     --with-pkgversion="Eva GCC" \
