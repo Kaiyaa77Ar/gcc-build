@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0
 # Author: Vaisakh Murali
+# Modifications: Kaiyaa77Ar
 set -e
 
 echo "*****************************************"
@@ -81,7 +82,7 @@ build_binutils() {
     --disable-werror \
     --enable-gold \
     --prefix="$PREFIX" \
-    --with-pkgversion="Eva Binutils" \
+    --with-pkgversion="Kai Binutils" \
     --with-sysroot
   make -j"$JOBS"
   make install -j"$JOBS"
@@ -119,7 +120,7 @@ build_gcc() {
     --with-gnu-ld \
     --with-linker-hash-style=gnu \
     --with-newlib \
-    --with-pkgversion="Eva GCC" \
+    --with-pkgversion="Kai GCC" \
     --with-sysroot
 
 if [ "$PHASE" == "instrument" ]; then
