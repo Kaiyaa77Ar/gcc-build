@@ -1,0 +1,121 @@
+
+name: Build GCC ARM64 Host
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build GCC on ARM64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+
+    env:
+      JOBS: 3
+
+    steps:
+      # 1. Checkout repository fork milikmu
+      - name: Checkout GCC
+        uses: actions/checkout@v4
+        with:
+          path: gcc-build
+
+      # 2. Install dependencies
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            flex \
+            bison \
+            gawk \
+            texinfo \
+            gcc \
+            g++ \
+            git \
+            wget \
+            curl \
+            patch \
+            tar \
+            file \
+            python3 \
+            libgmp-dev \
+            libmpfr-dev \
+            libmpc-dev \
+            libisl-dev \
+            zlib1g-dev \
+            libzstd-dev \
+            libssl-dev \
+            libncurses-dev
+
+      # 3. Configure upstream build script
+      - name: Configure GCC build script
+        working-directory: gcc-build
+        run: |
+          # Replace Git protocol with HTTPS
+          sed -i \
+            's#git://sourceware.org/git/binutils-gdb.git#https://sourceware.org/git/binutils-gdb.git#' \
+            build-gcc.sh
+
+          sed -i \
+            's#git://gcc.gnu.org/git/gcc.git#https://gcc.gnu.org/git/gcc.git#' \
+            build-gcc.sh
+
+          # Allow custom parallel build jobs
+          sed -i \
+            's/^JOBS=$(nproc --all)$/JOBS=${JOBS:-$(nproc --all)}/' \
+            build-gcc.sh
+
+          chmod +x build-gcc.sh
+
+          echo "Build configuration:"
+          head -n 20 build-gcc.sh
+
+      # 4. Build ARM32 GCC
+      - name: Build ARM32 GCC
+        working-directory: gcc-build
+        run: |
+          echo "Building ARM32 GCC..."
+          JOBS=${JOBS} ./build-gcc.sh -a arm
+
+      # 5. Build ARM64 GCC
+      - name: Build ARM64 GCC
+        working-directory: gcc-build
+        run: |
+          echo "Building ARM64 GCC..."
+          JOBS=${JOBS} ./build-gcc.sh -a arm64
+
+      # 6. Verify generated toolchains
+      - name: Verify toolchains
+        working-directory: gcc-build
+        run: |
+          echo "===== HOST ARCHITECTURE ====="
+          uname -m
+
+          echo "===== ARM32 GCC ====="
+          file gcc-arm/bin/arm-eabi-gcc
+          gcc-arm/bin/arm-eabi-gcc --version
+
+          echo "===== ARM64 GCC ====="
+          file gcc-arm64/bin/aarch64-elf-gcc
+          gcc-arm64/bin/aarch64-elf-gcc --version
+
+          echo "===== GCC TARGETS ====="
+          gcc-arm/bin/arm-eabi-gcc -dumpmachine
+          gcc-arm64/bin/aarch64-elf-gcc -dumpmachine
+
+      # 7. Upload compiled toolchains
+      - name: Upload GCC toolchains
+        uses: actions/upload-artifact@v4
+        with:
+          name: GCC-ARM64-Host
+          path: |
+            gcc-build/gcc-arm/
+            gcc-build/gcc-arm64/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 7
