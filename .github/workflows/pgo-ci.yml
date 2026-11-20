@@ -18,7 +18,7 @@ permissions:
 jobs:
   instrument:
     name: Build Instrumented GCC + PGO Data
-    runs-on: ${{ github.event.inputs.arch == 'arm32' && 'ubuntu-latest' || 'ubuntu-24.04-arm' }}
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
 
     env:
@@ -92,7 +92,7 @@ jobs:
   optimize:
     name: Build Optimized GCC (PGO + LTO)
     needs: instrument
-    runs-on: ${{ github.event.inputs.arch == 'arm32' && 'ubuntu-latest' || 'ubuntu-24.04-arm' }}
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
 
     env:
