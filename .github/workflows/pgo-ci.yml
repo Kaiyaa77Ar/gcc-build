@@ -1,0 +1,165 @@
+name: PGO Pipeline (Instrument + Train)
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: 'Architecture'
+        required: true
+        default: 'arm32'
+        type: choice
+        options:
+          - arm32
+          - arm64
+
+permissions:
+  contents: read
+
+jobs:
+  instrument:
+    name: Build Instrumented GCC + PGO Data
+    runs-on: ${{ github.event.inputs.arch == 'arm32' && 'ubuntu-latest' || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 360
+
+    env:
+      JOBS: 4
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: gcc-build
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential flex bison gawk texinfo \
+            gcc g++ git wget curl patch tar file \
+            python3 libgmp-dev libmpfr-dev libmpc-dev \
+            libisl-dev zlib1g-dev libzstd-dev libssl-dev \
+            libncurses-dev
+
+      - name: Configure build script
+        working-directory: gcc-build
+        run: |
+          sed -i \
+            's#git://sourceware.org/git/binutils-gdb.git#https://sourceware.org/git/binutils-gdb.git#' \
+            build-gcc.sh
+          sed -i \
+            's#git://gcc.gnu.org/git/gcc.git#https://gcc.gnu.org/git/gcc.git#' \
+            build-gcc.sh
+          sed -i \
+            's/^JOBS=$(nproc --all)$/JOBS=${JOBS:-$(nproc --all)}/' \
+            build-gcc.sh
+          chmod +x build-gcc.sh
+
+      - name: Build instrumented GCC
+        working-directory: gcc-build
+        run: |
+          ARCH=${{ github.event.inputs.arch == 'arm32' && 'arm' || 'arm64' }}
+          JOBS=${JOBS} ./build-gcc.sh -a $ARCH -p instrument
+
+      - name: Download Linux kernel for PGO corpus
+        working-directory: gcc-build
+        run: |
+          git clone --depth=1 https://github.com/torvalds/linux.git pgo-kernel
+          echo "Cloned kernel for PGO corpus"
+
+      - name: Collect PGO data
+        working-directory: gcc-build
+        run: |
+          ARCH=${{ github.event.inputs.arch == 'arm32' && 'arm' || 'arm64' }}
+          # Override KROOT to use the CI-cloned kernel instead of local path
+          sed -i 's|local KROOT="/root/kernel_xiaomi_beryllium"|local KROOT="${PWD}/pgo-kernel"|' build-gcc.sh
+          # Also fix the asm include paths for arm vs arm64
+          if [ "$ARCH" == "arm" ]; then
+            sed -i 's|arch/arm64/include|arch/arm/include|g' build-gcc.sh
+            sed -i 's|arch/arm64/include/uapi|arch/arm/include/uapi|g' build-gcc.sh
+            sed -i 's|arch/arm64/include/asm|arch/arm/include/asm|g' build-gcc.sh
+          fi
+          JOBS=${JOBS} ./build-gcc.sh -a $ARCH -p pgo-data
+
+      - name: Upload PGO Profiles
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgo-profiles-${{ github.event.inputs.arch }}
+          path: |
+            gcc-build/pgo-profiles-*/
+          if-no-files-found: error
+          retention-days: 3
+
+  optimize:
+    name: Build Optimized GCC (PGO + LTO)
+    needs: instrument
+    runs-on: ${{ github.event.inputs.arch == 'arm32' && 'ubuntu-latest' || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 360
+
+    env:
+      JOBS: 4
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: gcc-build
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential flex bison gawk texinfo \
+            gcc g++ git wget curl patch tar file \
+            python3 libgmp-dev libmpfr-dev libmpc-dev \
+            libisl-dev zlib1g-dev libzstd-dev libssl-dev \
+            libncurses-dev
+
+      - name: Download PGO Profiles
+        uses: actions/download-artifact@v4
+        with:
+          name: pgo-profiles-${{ github.event.inputs.arch }}
+          path: gcc-build/
+
+      - name: Configure build script
+        working-directory: gcc-build
+        run: |
+          sed -i \
+            's#git://sourceware.org/git/binutils-gdb.git#https://sourceware.org/git/binutils-gdb.git#' \
+            build-gcc.sh
+          sed -i \
+            's#git://gcc.gnu.org/git/gcc.git#https://gcc.gnu.org/git/gcc.git#' \
+            build-gcc.sh
+          sed -i \
+            's/^JOBS=$(nproc --all)$/JOBS=${JOBS:-$(nproc --all)}/' \
+            build-gcc.sh
+          chmod +x build-gcc.sh
+
+      - name: Build optimized GCC (PGO + LTO)
+        working-directory: gcc-build
+        run: |
+          ARCH=${{ github.event.inputs.arch == 'arm32' && 'arm' || 'arm64' }}
+          JOBS=${JOBS} ./build-gcc.sh -a $ARCH -p optimize
+
+      - name: Verify toolchain
+        working-directory: gcc-build
+        run: |
+          ARCH=${{ github.event.inputs.arch == 'arm32' && 'arm' || 'arm64' }}
+          if [ "$ARCH" == "arm" ]; then
+            file gcc-arm/bin/arm-eabi-gcc
+            gcc-arm/bin/arm-eabi-gcc --version
+            gcc-arm/bin/arm-eabi-gcc -dumpmachine
+          else
+            file gcc-arm64/bin/aarch64-elf-gcc
+            gcc-arm64/bin/aarch64-elf-gcc --version
+            gcc-arm64/bin/aarch64-elf-gcc -dumpmachine
+          fi
+
+      - name: Upload optimized toolchain
+        uses: actions/upload-artifact@v4
+        with:
+          name: gcc-optimized-${{ github.event.inputs.arch }}
+          path: |
+            gcc-build/gcc-*/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 7

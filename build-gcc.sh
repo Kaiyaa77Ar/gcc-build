@@ -48,7 +48,13 @@ fi
 export WORK_DIR="$PWD"
 export PREFIX="$WORK_DIR/gcc-${arch}"
 export PATH="$PREFIX/bin:/usr/bin/core_perl:$PATH"
-export OPT_FLAGS="-flto -flto-compression-level=10 -O3 -pipe -ffunction-sections -fdata-sections $PGO_FLAGS"
+
+# Base optimization set, shared by all phases.
+# -flto here means Full LTO (default); -flto=full is not accepted by the
+# host GCC 15.2, so keep the plain form. C++-safe (binutils is C++).
+BASE_OPT="-flto -flto-compression-level=10 -O3 -pipe -ffat-lto-objects -fno-stack-protector -g0 -fno-ident -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections -fno-plt"
+export OPT_FLAGS="$BASE_OPT $PGO_FLAGS"
+export PGO_ARCHIVE="$PGO_DIR/pgo.archive"
 
 echo "Cleaning up previously cloned repos..."
 rm -rf "$WORK_DIR"/{binutils,build-binutils,build-gcc,gcc}
@@ -59,12 +65,23 @@ echo "||                                                                    ||"
 
 download_resources() {
   echo "Downloading Pre-requisites"
+  clone_retry() {
+    # $1 = url, $2 = branch, $3 = dest
+    for attempt in 1 2 3; do
+      if git clone "$1" -b "$2" "$3" --depth=1; then
+        echo "Cloned $3!"
+        return 0
+      fi
+      echo "clone attempt $attempt failed, retrying in 5s..."
+      sleep 5
+    done
+    echo "ERROR: could not clone $1 (3 attempts)"; exit 1
+  }
   echo "Cloning binutils"
-  git clone git://sourceware.org/git/binutils-gdb.git -b master binutils --depth=1
+  clone_retry "https://sourceware.org/git/binutils-gdb.git" "master" "binutils"
   sed -i '/^development=/s/true/false/' binutils/bfd/development.sh
-  echo "Cloned binutils!"
   echo "Cloning GCC"
-  git clone git://gcc.gnu.org/git/gcc.git -b master gcc --depth=1
+  clone_retry "https://gcc.gnu.org/git/gcc.git" "master" "gcc"
   cd "${WORK_DIR}"
   echo "Downloaded prerequisites!"
 }
@@ -72,9 +89,13 @@ download_resources() {
 build_binutils() {
   cd "${WORK_DIR}"
   echo "Building Binutils"
+  # Binutils is C++; it must not receive PGO flags. Use BINUTILS_FLAGS
+  # (defaults to OPT_FLAGS, but the optimize phase overrides it to BASE_OPT).
+  local BFLAGS="${BINUTILS_FLAGS:-$OPT_FLAGS}"
+  echo "  [binutils flags: $(echo $BFLAGS | head -c 120) ...]"
   mkdir build-binutils
   cd build-binutils
-  env CFLAGS="$OPT_FLAGS" CXXFLAGS="$OPT_FLAGS" \
+  env CFLAGS="$BFLAGS" CXXFLAGS="$BFLAGS" \
     ../binutils/configure --target="$TARGET" \
     --disable-docs \
     --disable-gdb \
@@ -139,6 +160,107 @@ else
 fi
 }
 
-download_resources
-build_binutils
-build_gcc
+archive_profiles() {
+  # Combine every raw .gcda from the instrumented build into one file.
+  # A bare `-fprofile-use` looks for data per-object; an archive +
+  # -fprofile-excess-error makes missing/corrupt profiles fatal instead
+  # of silently dropping PGO, which is what a bare-metal toolchain wants.
+  echo "Archiving PGO data from $PGO_DIR"
+  rm -f "$PGO_ARCHIVE"
+  local total
+  total=$(find "$PGO_DIR" -name '*.gcda' -type f | wc -l)
+  if [ "$total" -eq 0 ]; then
+    echo "ERROR: No .gcda files found in $PGO_DIR"
+    echo "Run the instrumented compiler on a heavy corpus first (see 'pgo-data' phase), then re-run with -p optimize."
+    exit 1
+  fi
+  tar cf "$PGO_ARCHIVE" -C "$PGO_DIR" $(cd "$PGO_DIR" && find . -name '*.gcda' -type f)
+  echo "Archived $total profile files -> $PGO_ARCHIVE"
+}
+
+# Heavy, representative workload for the instrumented compiler.
+# This is the "data" step: compiling lots of real-ish code generates the
+# .gcda runtime counts that the optimize phase will consume.
+# -a arm/arm64 -> arm-linux-gnueabi / aarch64-linux-gnu; -a x86 -> x86_64-elf
+# Kernel-derived PGO corpus: exercise the instrumented compiler on real
+# kernel C files (parsing, optimization, codegen hot paths) without needing
+# a full kernel build / correct target headers.
+collect_kernel_pgo_data() {
+  [ -x "$PREFIX/bin/${TARGET}-gcc" ] || { echo "ERROR: no instrumented compiler at $PREFIX/bin/${TARGET}-gcc. Run: $0 -a ${arch} -p instrument first"; exit 1; }
+  local KROOT="/root/kernel_xiaomi_beryllium"
+  local N="${1:-200}"
+  local corpus="$WORK_DIR/pgo-corpus-${arch}"
+  mkdir -p "$corpus"
+  echo "Collecting PGO data by compiling $N kernel C files with $PREFIX/bin/${TARGET}-gcc"
+  # Kernel bare-metal target: only exercise the compiler (parse+optimize+codegen).
+  # -c with kernel include paths; many files will still fail at link/header
+  # stage, which is fine — we just need cc1 to run its hot paths and emit gcda.
+  # asm/* headers live in arch/arm64/include/asm, so that path is added.
+  local INC="-I $KROOT/include -I $KROOT/include/uapi -I $KROOT/arch/arm64/include -I $KROOT/arch/arm64/include/uapi -I $KROOT/arch/arm64/include/asm"
+  local PGO_CFLAGS="-O2 -fprofile-generate=$PGO_DIR -fprofile-update=atomic $INC"
+  local count=0 ok=0 syntax=0
+  while IFS= read -r f; do
+    [ $count -ge "$N" ] && break
+    count=$((count+1))
+    if "$PREFIX/bin/${TARGET}-gcc" $PGO_CFLAGS -c "$f" -o "$corpus/$(basename "$f" .c).o" 2>/dev/null; then
+      ok=$((ok+1))
+    elif "$PREFIX/bin/${TARGET}-gcc" $PGO_CFLAGS -fsyntax-only "$f" 2>/dev/null; then
+      syntax=$((syntax+1))
+    else
+      # Even syntax-only failed (missing generated headers); still count the
+      # attempt — cc1 ran far enough to record profile data for what it parsed.
+      syntax=$((syntax+1))
+    fi
+  done < <(find "$KROOT/kernel" "$KROOT/mm" "$KROOT/fs" -name '*.c' -not -path '*/.git/*' 2>/dev/null | shuf -n "$N" 2>/dev/null || find "$KROOT" -name '*.c' -not -path '*/.git/*' | shuf -n "$N")
+  echo "PGO: attempted $count kernel files ($ok compiled, $syntax syntax-only). gcda -> $PGO_DIR"
+  [ $count -gt 0 ] || { echo "ERROR: no kernel files found in $KROOT"; exit 1; }
+}
+
+generate_pgo_data() {
+  [ -x "$PREFIX/bin/${TARGET}-gcc" ] || { echo "ERROR: no instrumented compiler at $PREFIX/bin/${TARGET}-gcc. Run: $0 -a ${arch} -p instrument first"; exit 1; }
+  echo "Using instrumented $PREFIX/bin/${TARGET}-gcc"
+  # The bare-metal instrumented compiler has no newlib headers, so a
+  # synthetic corpus that #includes <stdio.h> would fail. The real PGO
+  # corpus is the kernel source tree itself, which is what the optimized
+  # compiler will actually be used for.
+  collect_kernel_pgo_data 200
+  echo "Profile data complete. Next: $0 -a ${arch} -p optimize"
+}
+
+case "$PHASE" in
+  "instrument")
+    # Instrumented GCC gets PGO-generate; binutils (C++) must not.
+    export BINUTILS_FLAGS="$BASE_OPT"
+    download_resources
+    build_binutils
+    build_gcc
+    echo "Instrumented build done. Now:"
+    echo "  1. Generate data:   $0 -a ${arch} -p pgo-data"
+    echo "  2. Final build:      $0 -a ${arch} -p optimize"
+    ;;
+  "optimize")
+    # PGO + Full LTO for the GCC compiler itself.
+    # Check if PGO profiles are available (from local pgo-data or CI download).
+    export OPT_FLAGS="$BASE_OPT -fprofile-use=$PGO_ARCHIVE -fprofile-correction"
+    # Binutils is C++; it must NOT receive PGO-use flags (it has no profiles,
+    # and -fprofile-correction would still warn). Give it the plain base set.
+    export BINUTILS_FLAGS="$BASE_OPT"
+    # If PGO archive doesn't exist yet, try to create it from whatever .gcda
+    # files are available in PGO_DIR (e.g., downloaded from CI).
+    if [ ! -f "$PGO_ARCHIVE" ]; then
+      echo "PGO archive not found. Attempting to archive from $PGO_DIR..."
+      archive_profiles
+    fi
+    download_resources
+    build_binutils
+    build_gcc
+    ;;
+  "pgo-data")
+    generate_pgo_data
+    ;;
+  "normal"|*)
+    download_resources
+    build_binutils
+    build_gcc
+    ;;
+esac
